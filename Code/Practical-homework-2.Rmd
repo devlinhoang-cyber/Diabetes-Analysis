@@ -1,0 +1,350 @@
+---
+title: "Practical homework 2"
+author: "Devlin Hoang"
+date: "2026-04-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(gbm)
+library(randomForest)
+library(e1071)
+library(caret)
+library(tidyverse)
+library(scales)
+library(gridExtra)
+library(pROC)
+set.seed(42)
+#Read data and remove NA
+health<- read.csv('nhis_2022.csv', stringsAsFactors = FALSE)
+cat('Helth dimension:', nrow(health), 'row x', ncol(health), 'cols\n')
+```
+
+```{r}
+df <- health %>%
+  filter(AGE>=18, AGE<997)%>%
+  filter(DIABETICEV %in% c(1,2))%>%
+  mutate(
+    diabetes= factor(
+      ifelse(DIABETICEV==2, 'Yes','No'),
+      levels= c('No','Yes') #'No' is the reference/negative class
+    )
+  )%>%
+  
+#Organize by sex
+filter(SEX %in% c(1,2))%>%
+mutate(sex_female= as.integer(SEX==2))%>%
+  
+#Organize by martial status:
+filter(MARSTCUR %in% 1:6)%>%
+mutate(partnered = as.integer(MARSTCUR %in% c(1,6)))%>%
+
+#Organize by education
+filter(EDUC %in% c(103, 116, 201, 202, 301, 302, 303, 400)) %>%
+  mutate(
+    educ_ord = case_when(
+      EDUC %in% c(103, 116) ~ 0,   # Less than HS
+      EDUC %in% c(201, 202) ~ 1,   # HS diploma/GED
+      EDUC %in% c(301, 302) ~ 2,   # Some college / AA
+      EDUC == 303           ~ 3,   # Bachelor's
+      EDUC == 400           ~ 4    # Graduate degree
+    )
+  ) %>%
+#Organize by income: 
+mutate(
+  poverty_grp= case_when(
+    POVERTY %in% 11:13 ~0, #low income
+    POVERTY %in% 21:31 ~1, #Middle class
+    POVERTY %in% 32:37~2, #Higher income
+  )
+)%>%
+#Rename BMICALC as BMI and store as a float with values >=90
+filter(BMICALC<90)%>%
+rename(bmi=BMICALC)%>%
+#Convert sleep hurs and rename HRSLEEP to sleep_hr
+filter(HRSLEEP>=1, HRSLEEP<=24)%>%
+rename(sleep_hr=HRSLEEP)%>%
+#Organize based on physical activities: 
+mutate(
+  mod_min  = ifelse(MOD10DMIN == 996, 0L, MOD10DMIN),
+    vig_min  = ifelse(VIG10DMIN == 996, 0L, VIG10DMIN)
+  ) %>%
+filter(mod_min < 990, vig_min < 990) %>%
+  
+#Filter by fruit and vegetable consumption habits: 
+#0-9 is valid, 90+ is missing (drop)
+filter(FRUTNO <90, VEGENO<90)%>%
+rename(fruit_wk= FRUTNO, veg_wk=VEGENO)%>%
+#Filter unhealthy diet habit
+filter(SODAPNO<90, PIZZANO<90, FRIESPNO<90)%>%
+rename(soda_wk=SODAPNO, pizza_wk=PIZZANO, fries_wk=FRIESPNO)%>%
+#Filter alcohol consumption habit: 
+mutate(alc_days= ifelse(ALCANYNO==996, 0L, ALCANYNO))%>%
+filter(alc_days>=0, alc_days<=365)%>%
+#Filter based on working hours:
+filter(HOURSWRK<97)%>%
+rename(work_hrs=HOURSWRK)
+
+cat('After cleaning data:', nrow(df),'adults with complete records\n\n')
+cat('Diabetes prevalance: \n')
+print(prop.table(table(df$diabetes)))
+```
+Clean up and preparing data for modeling
+
+```{r}
+#Final predictor set:
+#Demographics: age, sex, partnered, education, poverty
+#Boday/health: bmi, sleep hours
+#Physical act: mod_min, vig_min
+#Diet: fruit, vegetable, fries, pizza, soda
+#Lifestyle: alcohol per day, work hours
+model_cols<- c(
+  'diabetes',
+  'AGE','sex_female','partnered','educ_ord','poverty_grp',
+  'bmi','sleep_hr',
+  'mod_min','vig_min',
+  'fruit_wk','veg_wk','soda_wk','pizza_wk','fries_wk',
+  'alc_days','work_hrs')
+df_model <- df %>%
+  select(all_of(model_cols))%>%
+  drop_na()
+cat('Model-ready dataset: ', nrow(df_model),'rows', ncol(df_model)-1,'predictors \n')
+```
+```{r}
+#Exploratory data analysis: 
+#Age distribution by diabetes status:
+p_age<- ggplot(df_model, aes(x=AGE, fill= diabetes)) + geom_density(alpha=0.5) + scale_fill_manual(values= c('No'='steelblue', 'Yes'='red')) + labs(title= 'Age Distribution by Diabetes Status',
+                                                                                                                                                     x= 'Age (years)', y='Density', fill='Diabetes') + theme_minimal(base_size=12)
+
+#BMI by diabetes status: 
+p_bmi<- ggplot(df_model, aes(x= diabetes, y=bmi, fill= diabetes)) + geom_violin(alpha=0.6, trim= TRUE) + geom_boxplot(width=0.15, alpha=0.8, outlier.size=0.3) + scale_fill_manual(values= c('No'= 'skyblue','Yes'='darkred')) + labs(title= 'BMI by Diabetes Status', x='Diabetes', y='BMI') + theme_minimal(base_size=12) + theme(legend.position='none')
+
+#Vigorous activity:
+p_vig<- ggplot(df_model, aes(x= diabetes, y=vig_min, fill=diabetes))+ geom_boxplot(alpha=0.7, outlier.size=0.3) + scale_fill_manual(values= c('No'='blue', 'Yes'= 'tan')) + labs(title='Vigorous Activity (min) by Diabetes', x='Diabetes', y='Minutes vigorous activity/day')+ theme_minimal(base_size=12)+ theme(legend.position='none')
+
+#Sleepp hour:
+p_sleep<- ggplot(df_model, aes(x=sleep_hr, fill=diabetes))+ geom_histogram(position= 'identity',alpha=0.5,binwidth=1) + scale_fill_manual(values= c('No'='darkblue', 'Yes'= 'tomato')) + labs(title='Sleep hours per Night by Diabetes', x='Hours of sleep', y='Count', fill='Diabetes')+ theme_minimal(base_size=12)
+
+#Education vs diabetes prevalance: 
+p_educ <- df_model %>%
+  group_by(educ_ord, diabetes) %>% summarise(n = n(), .groups = "drop") %>%
+  group_by(educ_ord) %>% mutate(pct = n / sum(n)) %>%
+  filter(diabetes == "Yes") %>%
+  ungroup()%>%
+  mutate(educ_label = factor(educ_ord,
+    labels = c("< HS","HS/GED","Some college","Bachelor's","Graduate"))) %>%
+  ggplot(aes(x = educ_label, y = pct)) +
+  geom_col(fill = "salmon", alpha = 0.8) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Diabetes Prevalence by Education", x = NULL, y = "% with diabetes") +
+  theme_minimal(base_size = 12)
+
+#Soda consumption vs diabetes: 
+p_soda<- df_model %>%
+  mutate(soda_grp= cut(soda_wk, breaks=c(-1,0,1,3,9),
+                       labels= c('0','1','2-3','4+')))%>%
+  group_by(soda_grp, diabetes) %>% summarise(n=n(), .groups='drop')%>%
+  group_by(soda_grp) %>% mutate(pct=n/sum(n)) %>%
+  filter(diabetes=='Yes') %>%
+  ggplot(aes(x=soda_grp, y=pct))+ geom_col(fill='brown', alpha=0.8) + scale_y_continuous(labels= percent_format())+ labs(title= ' Diabetes Prevalance by Soda/Week', x='Soda per week', y='% with diabetes') + theme_minimal(base_size=12)
+
+eda_grid <- grid.arrange(p_age, p_bmi, p_vig, p_sleep, p_educ, p_soda, ncol=2)
+```
+
+Create different plots for different predictors vs diabetes
+
+```{r}
+#Train/test split
+n_yes<- sum(df_model$diabetes=='Yes')
+n_no<- sum(df_model$diabetes=='No')
+cat('Raw class count -- Yes:',n_yes,'| No: ',n_no, '\n')
+
+df_yes<- df_model %>% filter(diabetes=='Yes')
+df_no_sub<- df_model %>% filter(diabetes=='No') %>% sample_n(n_yes)
+df_balance<- bind_rows(df_yes,df_no_sub)%>%
+  slice_sample(prop=1)
+cat('Balance dataset: ',nrow(df_balance),'|Yes:',sum(df_balance$diabetes=='Yes'),'|No:',sum(df_balance$diabetes=='No'))
+
+#75/25 train test split:
+train_idx<- createDataPartition(df_balance$diabetes, p=0.75, list=FALSE)
+train_df<- df_balance[train_idx,]
+test_df<- df_balance[-train_idx,]
+cat('Train: ', nrow(train_df), '|Test: ', nrow(test_df),'\n')
+
+#Standardize continuous predictors (mu=0, sigma=1)
+continuous_cols<- c('AGE','bmi','sleep_hr','mod_min','vig_min','fruit_wk','veg_wk','soda_wk','pizza_wk','fries_wk','alc_days','work_hrs')
+preproc<- preProcess(train_df[,continuous_cols],method= c('center','scale'))
+train_scaled<- predict(preproc, train_df)
+test_scaled<- predict(preproc, test_df)
+```
+Train and test split for dataset with 75/25. Also downsaple for majority class predictors, some predictors were kept as is due to how narrow they are on the integer scale. 
+```{r}
+#Create function to evaluate SVM;
+evaluate_svm<- function(model, test_data, label){
+  preds<- predict(model, newdata= test_data)
+  cm<- confusionMatrix(preds,test_data$diabetes, positive='Yes')
+  roc_obj<- roc(as.numeric(test_data$diabetes =='Yes'),
+                as.numeric(preds=='Yes'), quiet=TRUE)
+  cat('\n======',label,'======\n')
+  cat(sprintf('Accuracy: %.4f\n', cm$overall['Accuracy']))
+  cat(sprintf('Sensitivity: %.4f\n', cm$byClass['Sensitivity']))
+  cat(sprintf('Specificity: %.4f\n', cm$byClass['Specificity']))
+  cat(sprintf('Precision: %.4f\n', cm$byClass['Precision']))
+  cat(sprintf('F1 score: %.4f\n', cm$byClass['F1']))
+  cat(sprintf('AUC: %.4f\n', auc(roc_obj)))
+  cat('\nConfusion Matrix:\n')
+  print(cm$table)
+  
+  list(label = label,
+       accuracy= unname(cm$overall['Accuracy']),
+       sens= unname(cm$byClass['Sensitivity']),
+       spec= unname(cm$byClass['Specificity']),
+       prec= unname(cm$byClass['Precision']),
+       f1= unname(cm$byClass['F1']),
+       auc= as.numeric(auc(roc_obj)),
+       roc= roc_obj,
+       cm= cm,
+       model= model)
+}
+```
+
+```{r}
+#Fit SVM  linear models: 
+tune_linear<- tune(
+  svm, 
+  diabetes~.,
+  data= train_scaled,
+  kernel='linear',
+  ranges= list(cost=c(0.001,0.01,0.1,1,10)),
+  tunecontrol=tune.control(cross=5)
+)
+cat('Best C: ', tune_linear$best.parameters$cost,'\n')
+cat('CV error: ',tune_linear$best.performance,'\n')
+res_linear<-evaluate_svm(tune_linear$best.model, test_scaled, 'Linear svm')
+
+#Fit SVM radial models: 
+tune_radial<- tune(
+  svm, 
+  diabetes~.,
+  data= train_scaled,
+  kernel='radial',
+  ranges= list(cost=c(0.1,1,10,100),
+               gamma= c(0.001,0.01,0.1,0.5)),
+  tunecontrol=tune.control(cross=5)
+)
+cat('Best C: ', tune_radial$best.parameters$cost,'|Best gamma:',tune_radial$best.parameters$gamma,'\n')
+cat('CV error: ', tune_radial$best.performance,'\n')
+res_radial<-evaluate_svm(tune_radial$best.model, test_scaled, 'Radial svm')
+
+#Fit SVM  polynomial models: 
+tune_polynomial<- tune(
+  svm, 
+  diabetes~.,
+  data= train_scaled,
+  kernel='polynomial',
+  ranges= list(cost=c(0.1,1,10),
+               degree= c(2,3),
+               coef0= c(0,1)),
+  tunecontrol=tune.control(cross=5)
+)
+cat('Best C: ', tune_polynomial$best.parameters$cost,'|Best degree:',tune_polynomial$best.parameters$degree,'|Best coefficient:',tune_polynomial$best.parameters$coef0,'\n')
+cat('CV error: ',tune_polynomial$best.performance,'\n')
+res_poly<-evaluate_svm(tune_polynomial$best.model, test_scaled, 'Polynomial svm')
+
+
+```
+
+Create and fit the dataset with different type of kernels
+
+```{r}
+#Model comparison: 
+comparison<- tibble(
+  Kernel= c('Linear','Radial','Polynomial'),
+  Accuracy= c(res_linear$accuracy, res_radial$accuracy, res_poly$accuracy),
+  sensitivity= c(res_linear$sens, res_radial$sens, res_poly$sens),
+  specificity= c(res_linear$spec, res_radial$spec, res_poly$spec),
+  F1= c(res_linear$f1, res_radial$f1, res_poly$f1),
+  AUC= c(res_linear$auc, res_radial$auc, res_poly$auc)
+)%>% mutate(across(where(is.numeric),~round(.,4)))
+
+cat('\n\n===== Model Comparison Table ===\n')
+print(comparison)
+```
+Create comparing table for all kernels type, with Radial seems to perform slightly bettern than linear.
+
+```{r}
+roc_df<- bind_rows( tibble(fpr=1- res_linear$roc$specificities, 
+                           tpr= res_linear$roc$sensitivities, kernel='Linear'), 
+                    tibble(fpr=1 - res_radial$roc$specificities, 
+                           tpr= res_radial$roc$sensitivities, kernel='Radial'), 
+                    tibble(fpr=1 - res_poly$roc$specificities, 
+                           tpr= res_poly$roc$sensitivities, kernel='Polynomial'))
+roc_plot <- ggplot(roc_df, aes(x = fpr, y = tpr, color = kernel)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  scale_color_manual(
+    values = c('Linear' = 'steelblue',
+               'Radial' = 'salmon',
+               'Polynomial' = 'darkgreen'),
+    labels = c(
+      "Linear" = paste0("Linear (AUC=", round(res_linear$auc, 3), ")"),
+      "Radial" = paste0("Radial (AUC=", round(res_radial$auc, 3), ")"),
+      "Polynomial" = paste0("Polynomial (AUC=", round(res_poly$auc, 3), ")")
+    )
+  ) +
+  labs(
+    title = "ROC Curves -- SVM Kernel Comparison",
+    subtitle = "Target: Diabetes (DIABETICEV) | NHIS 2022",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Kernel"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = c(0.7, 0.2))
+print(roc_plot)
+```
+
+Generate ROC curve for all SVM models 
+
+```{r}
+#Analysis based on SEX: 
+best_models<- list(res_linear, res_radial, res_poly)
+best_idx<- which.max(c(res_linear$auc, res_radial$auc, res_poly$auc))
+best_res<- best_models[[best_idx]]
+cat("\n\n=== SUBGROUP ANALYSIS BY SEX (best model:", best_res$label, ") ===\n")
+
+for(sex_val in c(0,1)){
+  label<- ifelse(sex_val==1, 'Female','Male')
+  subset<- test_scaled %>% filter(sex_female==sex_val)
+  if(nrow(subset)<20)next
+  preds<- predict(best_res$model, newdata=subset)
+  cm<- confusionMatrix(preds, subset$diabetes, positive='Yes')
+  roc_s<- roc(as.numeric(subset$diabetes=='Yes'),
+              as.numeric(preds=='Yes'),quiet=TRUE)
+  cat(sprintf('\n[%s | n=%d | diabetes=%.1f%%]\n',
+      label,nrow(subset),mean(subset$diabetes=='Yes')*100))
+  cat(sprintf('Accuracy: %.4f| F1: %.4f |AUC: %.4f\n',
+              cm$overall['Accuracy'], cm$byClass['F1'],auc(roc_s)))
+}
+
+#Analysis subgroup based on age (50+):
+cat('\n\n==== Group Analysis by AGE(50+)=====\n')
+test_50<- test_df%>% filter(AGE>=50)
+test_50_sc<-predict(preproc, test_50)
+
+cat('Test observation age 50+: ',nrow(test_50_sc),'\n')
+pred_50<- predict(best_res$model, newdata= test_50_sc)
+cm50<- confusionMatrix(pred_50, test_50_sc$diabetes, positive='Yes')
+roc_50<- roc(as.numeric(test_50_sc$diabetes =='Yes'),
+             as.numeric(pred_50 =='Yes'), quiet=TRUE)
+ cat(sprintf('Accuracy: %.4f| F1: %.4f |AUC: %.4f\n',
+              cm$overall['Accuracy'], cm$byClass['F1'],auc(roc_s)))
+``` 
+
